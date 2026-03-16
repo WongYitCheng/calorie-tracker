@@ -80,6 +80,7 @@ const IconUpload = () => (
     <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>
   </svg>
 );
+// eslint-disable-next-line no-unused-vars
 const IconFlame = () => (
   <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
     <path d="M12 2C9.5 5 8 7.5 8 10c0 2.2 1.8 4 4 4s4-1.8 4-4c0-.7-.2-1.4-.5-2C14.5 9.5 14 11 12 11c0 0 2-4 0-9z"/>
@@ -291,6 +292,7 @@ function ScanPage({ apiKey, onAdd }) {
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
   const fileRef = useRef();
+  // eslint-disable-next-line no-unused-vars
   const cameraRef = useRef();
   const videoRef = useRef();
   const streamRef = useRef();
