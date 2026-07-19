@@ -2,13 +2,16 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-const TDEE = 2904;
 const STORAGE_KEY = "calorie_tracker_v1";
 const API_KEY_STORAGE = "gemini_api_key";
+const TARGETS_STORAGE_KEY = "calorie_targets_v1";
+const DEFAULT_TARGETS = { calories: 2716, carbs: 232.5, protein: 148.8, fat: 83.7 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 const todayStr = () => new Date().toISOString().slice(0, 10);
 
+// entries are stored keyed by date with no cap, so history already persists
+// indefinitely (a year of daily entries is well under localStorage's ~5MB limit)
 function loadData() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; }
   catch { return {}; }
@@ -16,14 +19,21 @@ function loadData() {
 function saveData(data) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
 }
-function getLast30Days() {
-  return Array.from({ length: 30 }, (_, i) => {
-    const d = new Date(); d.setDate(d.getDate() - (29 - i));
+function loadTargets() {
+  try {
+    const t = JSON.parse(localStorage.getItem(TARGETS_STORAGE_KEY));
+    return t ? { ...DEFAULT_TARGETS, ...t } : { ...DEFAULT_TARGETS };
+  } catch { return { ...DEFAULT_TARGETS }; }
+}
+function saveTargets(t) {
+  localStorage.setItem(TARGETS_STORAGE_KEY, JSON.stringify(t));
+}
+// generic day-range generator so Trends can show a week, a month, or a full year
+function getLastNDays(n) {
+  return Array.from({ length: n }, (_, i) => {
+    const d = new Date(); d.setDate(d.getDate() - (n - 1 - i));
     return d.toISOString().slice(0, 10);
   });
-}
-function getLast7Days() {
-  return getLast30Days().slice(23);
 }
 function formatDate(str) {
   const d = new Date(str + "T00:00:00");
@@ -56,6 +66,38 @@ All nutritional values should be in grams (protein/fat/carbs) or kcal (calories)
         ]
       }]
     })
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error?.message || "API 请求失败");
+  }
+  const data = await res.json();
+  const text = data.candidates[0].content.parts[0].text.trim();
+  const clean = text.replace(/```json|```/g, "").trim();
+  return JSON.parse(clean);
+}
+
+// Text-based entry: user types a food name/description (optionally with amount)
+// and Gemini estimates nutrition the same way it would from a photo.
+async function analyzeFoodText(description, apiKey) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  const prompt = `Based on this food description (which may include a name, amount, and preparation method), estimate its nutrition. Respond ONLY with a JSON object (no markdown, no explanation):
+{
+  "name": "food name in Chinese",
+  "calories": number,
+  "protein": number,
+  "fat": number,
+  "carbs": number,
+  "portion": "the amount as stated, or your best estimate if not given",
+  "confidence": "high/medium/low"
+}
+All nutritional values should be in grams (protein/fat/carbs) or kcal (calories).
+Food description: "${description}"`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
   });
   if (!res.ok) {
     const err = await res.json();
@@ -120,6 +162,18 @@ const IconKey = () => (
     <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
   </svg>
 );
+const IconSettings = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="20" height="20">
+    <circle cx="12" cy="12" r="3"/>
+    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+  </svg>
+);
+const IconEdit = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="20" height="20">
+    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+  </svg>
+);
 
 // ─── API Key Setup Screen ─────────────────────────────────────────────────────
 function ApiKeySetup({ onSave }) {
@@ -181,24 +235,84 @@ function ApiKeySetup({ onSave }) {
   );
 }
 
+// ─── Settings Page (daily targets) ────────────────────────────────────────────
+function SettingsPage({ targets, onSave, onBack }) {
+  const [form, setForm] = useState({ ...targets });
+
+  function update(key, val) {
+    setForm(f => ({ ...f, [key]: val }));
+  }
+  function save() {
+    const cleaned = {
+      calories: Number(form.calories) || 0,
+      carbs: Number(form.carbs) || 0,
+      protein: Number(form.protein) || 0,
+      fat: Number(form.fat) || 0,
+    };
+    saveTargets(cleaned);
+    onSave(cleaned);
+    onBack();
+  }
+
+  const fields = [
+    { key: "calories", label: "每日热量目标", unit: "kcal" },
+    { key: "carbs", label: "碳水目标", unit: "g" },
+    { key: "protein", label: "蛋白质目标", unit: "g" },
+    { key: "fat", label: "脂肪目标", unit: "g" },
+  ];
+
+  return (
+    <div style={{ padding: "24px 20px 100px", maxWidth: "430px", margin: "0 auto" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "24px" }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", color: "#888", cursor: "pointer", fontSize: "20px", padding: 0, lineHeight: 1 }}>←</button>
+        <h1 style={{ color: "#fff", fontSize: "22px", fontWeight: "700", margin: 0 }}>每日目标设置</h1>
+      </div>
+      <div style={{ background: "#16161f", borderRadius: "20px", padding: "20px", border: "1px solid #2a2a3a", display: "flex", flexDirection: "column", gap: "16px" }}>
+        {fields.map(f => (
+          <div key={f.key}>
+            <label style={{ color: "#888", fontSize: "13px", display: "block", marginBottom: "6px" }}>{f.label}</label>
+            <div style={{ display: "flex", alignItems: "center", background: "#0a0a0f", border: "1px solid #2a2a3a", borderRadius: "12px", padding: "10px 14px" }}>
+              <input
+                type="number"
+                value={form[f.key]}
+                onChange={e => update(f.key, e.target.value)}
+                style={{ flex: 1, background: "transparent", border: "none", color: "#fff", fontSize: "16px", outline: "none" }}
+              />
+              <span style={{ color: "#555", fontSize: "13px" }}>{f.unit}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+      <button onClick={save} style={{ width: "100%", marginTop: "20px", background: "linear-gradient(135deg, #f97316, #ef4444)", border: "none", borderRadius: "14px", padding: "14px", color: "#fff", fontSize: "16px", fontWeight: "600", cursor: "pointer" }}>
+        保存
+      </button>
+    </div>
+  );
+}
+
 // ─── Home Page ────────────────────────────────────────────────────────────────
-function HomePage({ data, onNavigate }) {
+function HomePage({ data, targets, onNavigate, onOpenSettings }) {
   const today = todayStr();
   const todayEntries = data[today] || [];
   const totalCal = todayEntries.reduce((s, e) => s + e.calories, 0);
   const totalProtein = todayEntries.reduce((s, e) => s + (e.protein || 0), 0);
   const totalFat = todayEntries.reduce((s, e) => s + (e.fat || 0), 0);
   const totalCarbs = todayEntries.reduce((s, e) => s + (e.carbs || 0), 0);
-  const gap = TDEE - totalCal;
-  const pct = Math.min((totalCal / TDEE) * 100, 100);
-  const over = totalCal > TDEE;
+  const gap = targets.calories - totalCal;
+  const pct = Math.min((totalCal / targets.calories) * 100, 100);
+  const over = totalCal > targets.calories;
 
   return (
     <div style={{ padding: "24px 20px 100px", maxWidth: "430px", margin: "0 auto" }}>
       {/* Header */}
-      <div style={{ marginBottom: "28px" }}>
-        <p style={{ color: "#666", fontSize: "13px", margin: "0 0 4px" }}>{new Date().toLocaleDateString("zh-CN", { month: "long", day: "numeric", weekday: "long" })}</p>
-        <h1 style={{ color: "#fff", fontSize: "26px", fontWeight: "700", margin: 0 }}>今日摄入</h1>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "28px" }}>
+        <div>
+          <p style={{ color: "#666", fontSize: "13px", margin: "0 0 4px" }}>{new Date().toLocaleDateString("zh-CN", { month: "long", day: "numeric", weekday: "long" })}</p>
+          <h1 style={{ color: "#fff", fontSize: "26px", fontWeight: "700", margin: 0 }}>今日摄入</h1>
+        </div>
+        <button onClick={onOpenSettings} style={{ background: "#16161f", border: "1px solid #2a2a3a", borderRadius: "12px", width: "38px", height: "38px", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: "#888", marginTop: "4px" }}>
+          <IconSettings />
+        </button>
       </div>
 
       {/* Main Calorie Card */}
@@ -210,7 +324,7 @@ function HomePage({ data, onNavigate }) {
               <span style={{ color: over ? "#ef4444" : "#f97316", fontSize: "52px", fontWeight: "800", lineHeight: 1 }}>{totalCal.toLocaleString()}</span>
               <span style={{ color: "#888", fontSize: "16px" }}>kcal</span>
             </div>
-            <p style={{ color: "#666", fontSize: "13px", margin: "6px 0 0" }}>目标 {TDEE.toLocaleString()} kcal</p>
+            <p style={{ color: "#666", fontSize: "13px", margin: "6px 0 0" }}>目标 {targets.calories.toLocaleString()} kcal</p>
           </div>
           <div style={{ textAlign: "right" }}>
             <div style={{ color: over ? "#ef4444" : "#34d399", fontSize: "22px", fontWeight: "700" }}>
@@ -227,7 +341,7 @@ function HomePage({ data, onNavigate }) {
         <div style={{ display: "flex", justifyContent: "space-between", marginTop: "6px" }}>
           <span style={{ color: "#555", fontSize: "11px" }}>0</span>
           <span style={{ color: "#555", fontSize: "11px" }}>{pct.toFixed(0)}%</span>
-          <span style={{ color: "#555", fontSize: "11px" }}>{TDEE.toLocaleString()}</span>
+          <span style={{ color: "#555", fontSize: "11px" }}>{targets.calories.toLocaleString()}</span>
         </div>
 
         {over && (
@@ -238,18 +352,30 @@ function HomePage({ data, onNavigate }) {
         )}
       </div>
 
-      {/* Macros */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px", marginBottom: "20px" }}>
+      {/* Macros vs. target */}
+      <div style={{ background: "#16161f", borderRadius: "20px", padding: "18px 18px 14px", border: "1px solid #2a2a3a", marginBottom: "20px", display: "flex", flexDirection: "column", gap: "14px" }}>
         {[
-          { label: "蛋白质", value: totalProtein, unit: "g", color: "#60a5fa" },
-          { label: "脂肪", value: totalFat, unit: "g", color: "#f59e0b" },
-          { label: "碳水", value: totalCarbs, unit: "g", color: "#a78bfa" },
-        ].map(m => (
-          <div key={m.label} style={{ background: "#16161f", borderRadius: "16px", padding: "16px 12px", border: "1px solid #2a2a3a", textAlign: "center" }}>
-            <div style={{ color: m.color, fontSize: "22px", fontWeight: "700" }}>{m.value.toFixed(0)}<span style={{ fontSize: "12px", fontWeight: "400" }}>{m.unit}</span></div>
-            <div style={{ color: "#666", fontSize: "12px", marginTop: "4px" }}>{m.label}</div>
-          </div>
-        ))}
+          { label: "蛋白质", value: totalProtein, target: targets.protein, color: "#60a5fa" },
+          { label: "脂肪", value: totalFat, target: targets.fat, color: "#f59e0b" },
+          { label: "碳水", value: totalCarbs, target: targets.carbs, color: "#a78bfa" },
+        ].map(m => {
+          const mPct = Math.min((m.value / (m.target || 1)) * 100, 100);
+          const mOver = m.value > m.target;
+          return (
+            <div key={m.label}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "6px" }}>
+                <span style={{ color: "#999", fontSize: "13px" }}>{m.label}</span>
+                <span style={{ fontSize: "13px" }}>
+                  <span style={{ color: mOver ? "#ef4444" : "#e5e5e5", fontWeight: "600" }}>{m.value.toFixed(0)}</span>
+                  <span style={{ color: "#555" }}> / {m.target.toFixed(0)}g</span>
+                </span>
+              </div>
+              <div style={{ background: "rgba(255,255,255,0.08)", borderRadius: "99px", height: "6px", overflow: "hidden" }}>
+                <div style={{ width: `${mPct}%`, height: "100%", background: mOver ? "#ef4444" : m.color, borderRadius: "99px", transition: "width 0.6s ease" }} />
+              </div>
+            </div>
+          );
+        })}
       </div>
 
       {/* Recent entries */}
@@ -285,11 +411,14 @@ function HomePage({ data, onNavigate }) {
 
 // ─── Scan Page ────────────────────────────────────────────────────────────────
 function ScanPage({ apiKey, onAdd }) {
-  const [phase, setPhase] = useState("select"); // select | preview | analyzing | result | confirm
+  const [phase, setPhase] = useState("select"); // select | preview | textInput | analyzing | result
   const [imgSrc, setImgSrc] = useState(null);
   const [mimeType, setMimeType] = useState("image/jpeg");
   const [base64, setBase64] = useState(null);
-  const [result, setResult] = useState(null);
+  const [result, setResult] = useState(null);       // raw AI estimate (base portion, multiplier = 1)
+  const [multiplier, setMultiplier] = useState(1);   // portion size adjustment
+  const [form, setForm] = useState(null);            // editable, user-facing values
+  const [textDesc, setTextDesc] = useState("");       // for word/text-based entry
   const [error, setError] = useState("");
   const fileRef = useRef();
   // eslint-disable-next-line no-unused-vars
@@ -343,15 +472,40 @@ function ScanPage({ apiKey, onAdd }) {
     setPhase("analyzing"); setError("");
     try {
       const r = await analyzeFood(base64, mimeType, apiKey);
-      setResult(r); setPhase("result");
+      setResult(r);
+      setForm({ ...r });
+      setMultiplier(1);
+      setPhase("result");
     } catch (e) {
       setError("识别失败：" + e.message); setPhase("preview");
     }
   }
 
+  // Rescale calories/macros from the original AI estimate when portion multiplier changes.
+  // Manual edits to individual fields are preserved until the multiplier is touched again.
+  function applyMultiplier(m) {
+    if (!result) return;
+    setMultiplier(m);
+    setForm(f => ({
+      ...f,
+      calories: Math.round(result.calories * m),
+      protein: Math.round(result.protein * m * 10) / 10,
+      fat: Math.round(result.fat * m * 10) / 10,
+      carbs: Math.round(result.carbs * m * 10) / 10,
+    }));
+  }
+
+  function updateField(key, value) {
+    setForm(f => ({ ...f, [key]: value }));
+  }
+
   function confirmAdd() {
     const entry = {
-      ...result,
+      ...form,
+      calories: Math.round(Number(form.calories) || 0),
+      protein: Number(form.protein) || 0,
+      fat: Number(form.fat) || 0,
+      carbs: Number(form.carbs) || 0,
       time: new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }),
       id: Date.now()
     };
@@ -360,7 +514,22 @@ function ScanPage({ apiKey, onAdd }) {
   }
 
   function reset() {
-    setPhase("select"); setImgSrc(null); setBase64(null); setResult(null); setError(""); stopCamera();
+    setPhase("select"); setImgSrc(null); setBase64(null); setResult(null); setForm(null); setMultiplier(1); setError(""); setTextDesc(""); stopCamera();
+  }
+
+  async function analyzeText() {
+    if (!textDesc.trim()) return;
+    setPhase("analyzing"); setError("");
+    try {
+      const r = await analyzeFoodText(textDesc.trim(), apiKey);
+      setResult(r);
+      setForm({ ...r });
+      setMultiplier(1);
+      setImgSrc(null);
+      setPhase("result");
+    } catch (e) {
+      setError("识别失败：" + e.message); setPhase("textInput");
+    }
   }
 
   useEffect(() => () => stopCamera(), [stopCamera]);
@@ -391,11 +560,35 @@ function ScanPage({ apiKey, onAdd }) {
               <input ref={fileRef} type="file" accept="image/*" onChange={handleFileChange} style={{ display: "none" }} />
             </div>
           )}
+          {!cameraActive && (
+            <button onClick={() => setPhase("textInput")} style={{ width: "100%", background: "#16161f", border: "1px solid #2a2a3a", borderRadius: "16px", padding: "14px", color: "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", fontSize: "14px", fontWeight: "600", marginBottom: "20px" }}>
+              <IconEdit /> 文字输入食物
+            </button>
+          )}
           {error && <p style={{ color: "#ef4444", fontSize: "14px", textAlign: "center" }}>{error}</p>}
           <div style={{ background: "#16161f", borderRadius: "16px", padding: "16px", border: "1px solid #2a2a3a" }}>
-            <p style={{ color: "#666", fontSize: "13px", lineHeight: "1.6", margin: 0 }}>💡 小贴士：拍摄时让食物居中，光线充足，识别效果更佳</p>
+            <p style={{ color: "#666", fontSize: "13px", lineHeight: "1.6", margin: 0 }}>💡 小贴士：拍摄时让食物居中，光线充足，识别效果更佳；也可以直接用文字描述食物和份量</p>
           </div>
         </>
+      )}
+
+      {phase === "textInput" && (
+        <div>
+          <p style={{ color: "#666", fontSize: "13px", marginBottom: "12px", lineHeight: "1.6" }}>输入食物名称和份量，AI 将估算热量与营养成分</p>
+          <textarea
+            value={textDesc}
+            onChange={e => setTextDesc(e.target.value)}
+            placeholder="例如：鸡胸肉200克 / 一碗牛肉面 / 苹果一个"
+            rows={4}
+            autoFocus
+            style={{ width: "100%", background: "#16161f", border: "1px solid #2a2a3a", borderRadius: "16px", padding: "14px 16px", color: "#fff", fontSize: "15px", outline: "none", boxSizing: "border-box", marginBottom: "16px", resize: "none", fontFamily: "inherit" }}
+          />
+          {error && <p style={{ color: "#ef4444", fontSize: "14px", marginBottom: "12px" }}>{error}</p>}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+            <button onClick={reset} style={{ background: "#16161f", border: "1px solid #2a2a3a", borderRadius: "14px", padding: "14px", color: "#fff", cursor: "pointer", fontSize: "15px" }}>取消</button>
+            <button onClick={analyzeText} disabled={!textDesc.trim()} style={{ background: "linear-gradient(135deg, #f97316, #ef4444)", border: "none", borderRadius: "14px", padding: "14px", color: "#fff", cursor: textDesc.trim() ? "pointer" : "not-allowed", opacity: textDesc.trim() ? 1 : 0.5, fontSize: "15px", fontWeight: "600" }}>开始识别 🔍</button>
+          </div>
+        </div>
       )}
 
       {phase === "preview" && imgSrc && (
@@ -418,36 +611,82 @@ function ScanPage({ apiKey, onAdd }) {
         </div>
       )}
 
-      {phase === "result" && result && (
+      {phase === "result" && result && form && (
         <div>
-          <img src={imgSrc} alt="food" style={{ width: "100%", borderRadius: "20px", marginBottom: "16px", maxHeight: "240px", objectFit: "cover" }} />
+          {imgSrc ? (
+            <img src={imgSrc} alt="food" style={{ width: "100%", borderRadius: "20px", marginBottom: "16px", maxHeight: "240px", objectFit: "cover" }} />
+          ) : (
+            <div style={{ width: "100%", height: "100px", borderRadius: "20px", marginBottom: "16px", background: "#16161f", border: "1px solid #2a2a3a", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "36px" }}>✏️</div>
+          )}
+
+          {/* Portion size adjustment */}
+          <div style={{ background: "#16161f", borderRadius: "16px", padding: "14px 16px", border: "1px solid #2a2a3a", marginBottom: "14px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+              <span style={{ color: "#888", fontSize: "13px" }}>份量调整（AI 估算：{result.portion}）</span>
+              <span style={{ color: "#f97316", fontSize: "13px", fontWeight: "600" }}>{multiplier}x</span>
+            </div>
+            <div style={{ display: "flex", gap: "8px" }}>
+              {[0.5, 0.75, 1, 1.5, 2].map(m => (
+                <button
+                  key={m}
+                  onClick={() => applyMultiplier(m)}
+                  style={{
+                    flex: 1, padding: "8px 0", borderRadius: "10px", border: "1px solid",
+                    borderColor: multiplier === m ? "#f97316" : "#2a2a3a",
+                    background: multiplier === m ? "rgba(249,115,22,0.15)" : "transparent",
+                    color: multiplier === m ? "#f97316" : "#666",
+                    cursor: "pointer", fontSize: "13px", fontWeight: "600"
+                  }}
+                >
+                  {m}x
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Editable result card */}
           <div style={{ background: "#16161f", borderRadius: "20px", padding: "24px", border: "1px solid #2a2a3a", marginBottom: "14px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "20px" }}>
-              <div>
-                <h2 style={{ color: "#fff", fontSize: "22px", fontWeight: "700", margin: "0 0 6px" }}>{result.name}</h2>
-                <span style={{ color: "#555", fontSize: "13px" }}>📏 {result.portion}</span>
-              </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ color: "#f97316", fontSize: "32px", fontWeight: "800", lineHeight: 1 }}>{result.calories}</div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "12px", marginBottom: "20px" }}>
+              <input
+                value={form.name}
+                onChange={e => updateField("name", e.target.value)}
+                style={{ flex: 1, background: "transparent", border: "none", borderBottom: "1px solid #2a2a3a", color: "#fff", fontSize: "20px", fontWeight: "700", padding: "4px 0", outline: "none" }}
+              />
+              <div style={{ textAlign: "right", flexShrink: 0 }}>
+                <input
+                  type="number"
+                  value={form.calories}
+                  onChange={e => updateField("calories", e.target.value)}
+                  style={{ width: "90px", background: "transparent", border: "none", borderBottom: "1px solid #2a2a3a", color: "#f97316", fontSize: "26px", fontWeight: "800", textAlign: "right", outline: "none" }}
+                />
                 <div style={{ color: "#666", fontSize: "12px" }}>kcal</div>
               </div>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px" }}>
               {[
-                { label: "蛋白质", value: result.protein, color: "#60a5fa" },
-                { label: "脂肪", value: result.fat, color: "#f59e0b" },
-                { label: "碳水", value: result.carbs, color: "#a78bfa" },
+                { key: "protein", label: "蛋白质", color: "#60a5fa" },
+                { key: "fat", label: "脂肪", color: "#f59e0b" },
+                { key: "carbs", label: "碳水", color: "#a78bfa" },
               ].map(m => (
-                <div key={m.label} style={{ background: "#0a0a0f", borderRadius: "12px", padding: "12px", textAlign: "center" }}>
-                  <div style={{ color: m.color, fontSize: "18px", fontWeight: "700" }}>{m.value}g</div>
+                <div key={m.key} style={{ background: "#0a0a0f", borderRadius: "12px", padding: "10px", textAlign: "center" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "2px" }}>
+                    <input
+                      type="number"
+                      value={form[m.key]}
+                      onChange={e => updateField(m.key, e.target.value)}
+                      style={{ width: "48px", background: "transparent", border: "none", color: m.color, fontSize: "16px", fontWeight: "700", textAlign: "right", outline: "none" }}
+                    />
+                    <span style={{ color: m.color, fontSize: "12px" }}>g</span>
+                  </div>
                   <div style={{ color: "#555", fontSize: "11px", marginTop: "3px" }}>{m.label}</div>
                 </div>
               ))}
             </div>
             <div style={{ marginTop: "14px", textAlign: "right" }}>
-              <span style={{ color: "#444", fontSize: "12px" }}>置信度：{result.confidence === "high" ? "高 ✓" : result.confidence === "medium" ? "中等" : "较低"}</span>
+              <span style={{ color: "#444", fontSize: "12px" }}>置信度：{result.confidence === "high" ? "高 ✓" : result.confidence === "medium" ? "中等" : "较低"} · 可直接点击数值修改</span>
             </div>
           </div>
+
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
             <button onClick={reset} style={{ background: "#16161f", border: "1px solid #2a2a3a", borderRadius: "14px", padding: "14px", color: "#fff", cursor: "pointer", fontSize: "15px" }}>重新识别</button>
             <button onClick={confirmAdd} style={{ background: "linear-gradient(135deg, #22c55e, #16a34a)", border: "none", borderRadius: "14px", padding: "14px", color: "#fff", cursor: "pointer", fontSize: "15px", fontWeight: "600" }}>✓ 添加记录</button>
@@ -500,25 +739,34 @@ function RecordsPage({ data, onDelete }) {
 }
 
 // ─── Trends Page ──────────────────────────────────────────────────────────────
-function TrendsPage({ data }) {
+function TrendsPage({ data, targets }) {
   const [range, setRange] = useState(7);
-  const days = range === 7 ? getLast7Days() : getLast30Days();
+  const days = getLastNDays(range);
   const chartData = days.map(d => ({
     date: formatDate(d),
     calories: (data[d] || []).reduce((s, e) => s + e.calories, 0),
-    over: (data[d] || []).reduce((s, e) => s + e.calories, 0) > TDEE
+    over: (data[d] || []).reduce((s, e) => s + e.calories, 0) > targets.calories
   }));
   const avg = chartData.filter(d => d.calories > 0).reduce((s, d) => s + d.calories, 0) / (chartData.filter(d => d.calories > 0).length || 1);
+  // sparser x-axis ticks as the range grows, otherwise a year of bars is unreadable
+  const tickInterval = range <= 7 ? 0 : range <= 30 ? 4 : range <= 90 ? 13 : 29;
+
+  const RANGES = [
+    { days: 7, label: "7天" },
+    { days: 30, label: "30天" },
+    { days: 90, label: "90天" },
+    { days: 365, label: "全年" },
+  ];
 
   return (
     <div style={{ padding: "24px 20px 100px", maxWidth: "430px", margin: "0 auto" }}>
       <h1 style={{ color: "#fff", fontSize: "24px", fontWeight: "700", marginBottom: "6px" }}>卡路里趋势</h1>
-      <p style={{ color: "#666", fontSize: "13px", marginBottom: "20px" }}>目标 {TDEE.toLocaleString()} kcal/天</p>
+      <p style={{ color: "#666", fontSize: "13px", marginBottom: "20px" }}>目标 {targets.calories.toLocaleString()} kcal/天</p>
 
-      <div style={{ display: "flex", gap: "8px", marginBottom: "24px" }}>
-        {[7, 30].map(r => (
-          <button key={r} onClick={() => setRange(r)} style={{ padding: "8px 20px", borderRadius: "99px", border: "1px solid", borderColor: range === r ? "#f97316" : "#2a2a3a", background: range === r ? "rgba(249,115,22,0.15)" : "transparent", color: range === r ? "#f97316" : "#666", cursor: "pointer", fontSize: "14px" }}>
-            {r}天
+      <div style={{ display: "flex", gap: "8px", marginBottom: "24px", flexWrap: "wrap" }}>
+        {RANGES.map(r => (
+          <button key={r.days} onClick={() => setRange(r.days)} style={{ padding: "8px 16px", borderRadius: "99px", border: "1px solid", borderColor: range === r.days ? "#f97316" : "#2a2a3a", background: range === r.days ? "rgba(249,115,22,0.15)" : "transparent", color: range === r.days ? "#f97316" : "#666", cursor: "pointer", fontSize: "14px" }}>
+            {r.label}
           </button>
         ))}
       </div>
@@ -526,7 +774,7 @@ function TrendsPage({ data }) {
       <div style={{ background: "#16161f", borderRadius: "20px", padding: "20px 10px 10px", border: "1px solid #2a2a3a", marginBottom: "16px" }}>
         <ResponsiveContainer width="100%" height={200}>
           <BarChart data={chartData} margin={{ top: 0, right: 10, left: -20, bottom: 0 }}>
-            <XAxis dataKey="date" tick={{ fill: "#555", fontSize: 11 }} axisLine={false} tickLine={false} interval={range === 7 ? 0 : 4} />
+            <XAxis dataKey="date" tick={{ fill: "#555", fontSize: 11 }} axisLine={false} tickLine={false} interval={tickInterval} />
             <YAxis tick={{ fill: "#555", fontSize: 11 }} axisLine={false} tickLine={false} />
             <Tooltip contentStyle={{ background: "#1a1a2a", border: "1px solid #2a2a3a", borderRadius: "10px", color: "#fff" }} formatter={v => [`${v} kcal`, "摄入"]} />
             <Bar dataKey="calories" radius={[6, 6, 0, 0]}>
@@ -550,8 +798,8 @@ function TrendsPage({ data }) {
         </div>
         <div style={{ background: "#16161f", borderRadius: "16px", padding: "18px", border: "1px solid #2a2a3a" }}>
           <div style={{ color: "#666", fontSize: "12px", marginBottom: "6px" }}>vs 目标</div>
-          <div style={{ color: avg > TDEE ? "#ef4444" : "#34d399", fontSize: "22px", fontWeight: "700" }}>
-            {avg > TDEE ? "+" : ""}{Math.round(avg - TDEE).toLocaleString()}
+          <div style={{ color: avg > targets.calories ? "#ef4444" : "#34d399", fontSize: "22px", fontWeight: "700" }}>
+            {avg > targets.calories ? "+" : ""}{Math.round(avg - targets.calories).toLocaleString()}
           </div>
           <div style={{ color: "#666", fontSize: "12px" }}>kcal/天</div>
         </div>
@@ -565,6 +813,7 @@ export default function App() {
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(API_KEY_STORAGE) || "");
   const [page, setPage] = useState("home");
   const [data, setData] = useState(loadData);
+  const [targets, setTargets] = useState(loadTargets);
 
   function addEntry(entry) {
     const today = todayStr();
@@ -598,10 +847,11 @@ export default function App() {
       <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
 
       {/* Page Content */}
-      {page === "home" && <HomePage data={data} onNavigate={setPage} />}
+      {page === "home" && <HomePage data={data} targets={targets} onNavigate={setPage} onOpenSettings={() => setPage("settings")} />}
       {page === "scan" && <ScanPage apiKey={apiKey} onAdd={addEntry} />}
       {page === "records" && <RecordsPage data={data} onDelete={deleteEntry} />}
-      {page === "trends" && <TrendsPage data={data} />}
+      {page === "trends" && <TrendsPage data={data} targets={targets} />}
+      {page === "settings" && <SettingsPage targets={targets} onSave={setTargets} onBack={() => setPage("home")} />}
 
       {/* Bottom Nav */}
       <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, background: "rgba(10,10,15,0.95)", backdropFilter: "blur(20px)", borderTop: "1px solid #1a1a2a", padding: "10px 0 20px", display: "flex", justifyContent: "space-around", alignItems: "center", zIndex: 100 }}>
