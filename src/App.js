@@ -5,6 +5,7 @@ import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 
 const STORAGE_KEY = "calorie_tracker_v1";
 const API_KEY_STORAGE = "gemini_api_key";
 const TARGETS_STORAGE_KEY = "calorie_targets_v1";
+const LEARNED_UNITS_KEY = "learned_units_v1";
 const DEFAULT_TARGETS = { calories: 2716, carbs: 232.5, protein: 148.8, fat: 83.7 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -40,8 +41,51 @@ function formatDate(str) {
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
+// ─── Learned unit weights (per-user portion memory) ───────────────────────────
+// When a user corrects how many pieces/units a food actually was, we remember
+// the resulting per-unit nutrition for that food name, so next time the same
+// food is detected the AI starts from the user's real-world portions instead
+// of a generic guess.
+function loadLearnedUnits() {
+  try { return JSON.parse(localStorage.getItem(LEARNED_UNITS_KEY)) || {}; }
+  catch { return {}; }
+}
+function saveLearnedUnits(u) {
+  localStorage.setItem(LEARNED_UNITS_KEY, JSON.stringify(u));
+}
+// Rolling average over the last N corrections so it adapts but isn't thrown
+// off by one outlier entry.
+function recordUnitCorrection(name, unitName, perUnit) {
+  const learned = loadLearnedUnits();
+  const prev = learned[name];
+  const MAX_SAMPLES = 8;
+  const samples = prev ? Math.min(prev.samples + 1, MAX_SAMPLES) : 1;
+  const w = prev ? 1 / samples : 1;
+  const blended = prev
+    ? {
+        calories: prev.calories * (1 - w) + perUnit.calories * w,
+        protein: prev.protein * (1 - w) + perUnit.protein * w,
+        fat: prev.fat * (1 - w) + perUnit.fat * w,
+        carbs: prev.carbs * (1 - w) + perUnit.carbs * w,
+      }
+    : perUnit;
+  learned[name] = { unitName, samples, ...blended };
+  saveLearnedUnits(learned);
+}
+// Builds a short hint injected into the AI prompt so past corrections inform
+// future estimates. Kept short (a handful of entries) to avoid bloating the prompt.
+function buildLearnedHint(learned) {
+  const names = Object.keys(learned).slice(-5);
+  if (names.length === 0) return "";
+  const lines = names.map(n => {
+    const u = learned[n];
+    return `- ${n}：约 ${Math.round(u.calories)} kcal/${u.unitName}（用户历史修正，${u.samples}次）`;
+  });
+  return `\n\n用户历史份量修正参考（如果识别到同名或相似食物，请优先参考这些真实份量数据）：\n${lines.join("\n")}`;
+}
+
 // ─── Gemini API ───────────────────────────────────────────────────────────────
-async function analyzeFood(imageBase64, mimeType, apiKey) {
+async function analyzeFood(imageBase64, mimeType, apiKey, learnedUnits = {}) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
   const prompt = `Analyze this food image and respond ONLY with a JSON object (no markdown, no explanation):
 {
@@ -50,10 +94,13 @@ async function analyzeFood(imageBase64, mimeType, apiKey) {
   "protein": number,
   "fat": number,
   "carbs": number,
-  "portion": "estimated portion size",
-  "confidence": "high/medium/low"
+  "portion": "estimated portion size, described in natural units where possible (e.g. '3块' not just weight)",
+  "confidence": "high/medium/low",
+  "countable": boolean (true if this food naturally comes in discrete pieces the user could recount, e.g. dumplings, charsiew slices, chicken wings, shrimp; false for things like rice, soup, salad where counting pieces doesn't make sense),
+  "unit_name": "the counting word for one piece, in Chinese (e.g. '块', '个', '只', '片'), or null if countable is false",
+  "unit_count": number of pieces you estimate are in the image, or null if countable is false
 }
-All nutritional values should be in grams (protein/fat/carbs) or kcal (calories).`;
+All nutritional values should be in grams (protein/fat/carbs) or kcal (calories) for the TOTAL portion shown, not per unit.${buildLearnedHint(learnedUnits)}`;
 
   const res = await fetch(url, {
     method: "POST",
@@ -79,7 +126,7 @@ All nutritional values should be in grams (protein/fat/carbs) or kcal (calories)
 
 // Text-based entry: user types a food name/description (optionally with amount)
 // and Gemini estimates nutrition the same way it would from a photo.
-async function analyzeFoodText(description, apiKey) {
+async function analyzeFoodText(description, apiKey, learnedUnits = {}) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
   const prompt = `Based on this food description (which may include a name, amount, and preparation method), estimate its nutrition. Respond ONLY with a JSON object (no markdown, no explanation):
 {
@@ -88,10 +135,13 @@ async function analyzeFoodText(description, apiKey) {
   "protein": number,
   "fat": number,
   "carbs": number,
-  "portion": "the amount as stated, or your best estimate if not given",
-  "confidence": "high/medium/low"
+  "portion": "the amount as stated, or your best estimate if not given, described in natural units where possible (e.g. '3块' not just weight)",
+  "confidence": "high/medium/low",
+  "countable": boolean (true if this food naturally comes in discrete pieces the user could recount, e.g. dumplings, charsiew slices, chicken wings, shrimp; false for things like rice, soup, salad where counting pieces doesn't make sense),
+  "unit_name": "the counting word for one piece, in Chinese (e.g. '块', '个', '只', '片'), or null if countable is false",
+  "unit_count": number of pieces implied or stated in the description, or null if countable is false
 }
-All nutritional values should be in grams (protein/fat/carbs) or kcal (calories).
+All nutritional values should be in grams (protein/fat/carbs) or kcal (calories) for the TOTAL amount described, not per unit.${buildLearnedHint(learnedUnits)}
 Food description: "${description}"`;
 
   const res = await fetch(url, {
@@ -416,7 +466,9 @@ function ScanPage({ apiKey, onAdd }) {
   const [mimeType, setMimeType] = useState("image/jpeg");
   const [base64, setBase64] = useState(null);
   const [result, setResult] = useState(null);       // raw AI estimate (base portion, multiplier = 1)
-  const [multiplier, setMultiplier] = useState(1);   // portion size adjustment
+  const [multiplier, setMultiplier] = useState(1);   // portion size adjustment (non-countable foods)
+  const [unitCount, setUnitCount] = useState(1);      // user-corrected piece count (countable foods)
+  const [sizeFactor, setSizeFactor] = useState(1);    // "each piece was smaller/bigger than assumed"
   const [form, setForm] = useState(null);            // editable, user-facing values
   const [textDesc, setTextDesc] = useState("");       // for word/text-based entry
   const [error, setError] = useState("");
@@ -471,10 +523,12 @@ function ScanPage({ apiKey, onAdd }) {
   async function analyze() {
     setPhase("analyzing"); setError("");
     try {
-      const r = await analyzeFood(base64, mimeType, apiKey);
+      const r = await analyzeFood(base64, mimeType, apiKey, loadLearnedUnits());
       setResult(r);
       setForm({ ...r });
       setMultiplier(1);
+      setUnitCount(r.countable && r.unit_count ? r.unit_count : 1);
+      setSizeFactor(1);
       setPhase("result");
     } catch (e) {
       setError("识别失败：" + e.message); setPhase("preview");
@@ -495,6 +549,50 @@ function ScanPage({ apiKey, onAdd }) {
     }));
   }
 
+  // Per-unit nutrition, derived from the AI's original total ÷ its original
+  // estimated count. This stays fixed as the anchor; count/size corrections
+  // just multiply against it, so the user never has to think in grams.
+  function getPerUnit() {
+    const baseCount = (result.unit_count && result.unit_count > 0) ? result.unit_count : 1;
+    return {
+      calories: result.calories / baseCount,
+      protein: result.protein / baseCount,
+      fat: result.fat / baseCount,
+      carbs: result.carbs / baseCount,
+    };
+  }
+
+  // Called when the user corrects "how many pieces" (descriptive, not gram-based).
+  function applyUnitCount(n) {
+    if (!result) return;
+    const count = Math.max(1, n);
+    setUnitCount(count);
+    const perUnit = getPerUnit();
+    setForm(f => ({
+      ...f,
+      calories: Math.round(perUnit.calories * count * sizeFactor),
+      protein: Math.round(perUnit.protein * count * sizeFactor * 10) / 10,
+      fat: Math.round(perUnit.fat * count * sizeFactor * 10) / 10,
+      carbs: Math.round(perUnit.carbs * count * sizeFactor * 10) / 10,
+      portion: `${count}${result.unit_name || "份"}`,
+    }));
+  }
+
+  // Called when the user says each piece looked smaller/about right/bigger
+  // than the AI assumed — a second, independent axis from count.
+  function applySizeFactor(sf) {
+    if (!result) return;
+    setSizeFactor(sf);
+    const perUnit = getPerUnit();
+    setForm(f => ({
+      ...f,
+      calories: Math.round(perUnit.calories * unitCount * sf),
+      protein: Math.round(perUnit.protein * unitCount * sf * 10) / 10,
+      fat: Math.round(perUnit.fat * unitCount * sf * 10) / 10,
+      carbs: Math.round(perUnit.carbs * unitCount * sf * 10) / 10,
+    }));
+  }
+
   function updateField(key, value) {
     setForm(f => ({ ...f, [key]: value }));
   }
@@ -510,21 +608,38 @@ function ScanPage({ apiKey, onAdd }) {
       id: Date.now()
     };
     onAdd(entry);
+
+    // If the user corrected the piece count or size for a countable food,
+    // remember the resulting per-unit nutrition so future estimates for
+    // this food start from the user's real portions instead of guessing again.
+    if (result && result.countable && (unitCount !== result.unit_count || sizeFactor !== 1)) {
+      const perUnit = {
+        calories: (entry.calories / unitCount),
+        protein: (entry.protein / unitCount),
+        fat: (entry.fat / unitCount),
+        carbs: (entry.carbs / unitCount),
+      };
+      recordUnitCorrection(form.name, result.unit_name || "份", perUnit);
+    }
+
     reset();
   }
 
   function reset() {
-    setPhase("select"); setImgSrc(null); setBase64(null); setResult(null); setForm(null); setMultiplier(1); setError(""); setTextDesc(""); stopCamera();
+    setPhase("select"); setImgSrc(null); setBase64(null); setResult(null); setForm(null);
+    setMultiplier(1); setUnitCount(1); setSizeFactor(1); setError(""); setTextDesc(""); stopCamera();
   }
 
   async function analyzeText() {
     if (!textDesc.trim()) return;
     setPhase("analyzing"); setError("");
     try {
-      const r = await analyzeFoodText(textDesc.trim(), apiKey);
+      const r = await analyzeFoodText(textDesc.trim(), apiKey, loadLearnedUnits());
       setResult(r);
       setForm({ ...r });
       setMultiplier(1);
+      setUnitCount(r.countable && r.unit_count ? r.unit_count : 1);
+      setSizeFactor(1);
       setImgSrc(null);
       setPhase("result");
     } catch (e) {
@@ -619,30 +734,70 @@ function ScanPage({ apiKey, onAdd }) {
             <div style={{ width: "100%", height: "100px", borderRadius: "20px", marginBottom: "16px", background: "#16161f", border: "1px solid #2a2a3a", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "36px" }}>✏️</div>
           )}
 
-          {/* Portion size adjustment */}
-          <div style={{ background: "#16161f", borderRadius: "16px", padding: "14px 16px", border: "1px solid #2a2a3a", marginBottom: "14px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-              <span style={{ color: "#888", fontSize: "13px" }}>份量调整（AI 估算：{result.portion}）</span>
-              <span style={{ color: "#f97316", fontSize: "13px", fontWeight: "600" }}>{multiplier}x</span>
-            </div>
-            <div style={{ display: "flex", gap: "8px" }}>
-              {[0.5, 0.75, 1, 1.5, 2].map(m => (
+          {/* Portion adjustment: descriptive count for countable foods, multiplier otherwise */}
+          {result.countable ? (
+            <div style={{ background: "#16161f", borderRadius: "16px", padding: "14px 16px", border: "1px solid #2a2a3a", marginBottom: "14px" }}>
+              <div style={{ color: "#888", fontSize: "13px", marginBottom: "10px" }}>
+                AI 识别数量：{result.unit_count || 1} {result.unit_name || "份"} · 数量不对可直接改
+              </div>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "16px", marginBottom: "14px" }}>
                 <button
-                  key={m}
-                  onClick={() => applyMultiplier(m)}
-                  style={{
-                    flex: 1, padding: "8px 0", borderRadius: "10px", border: "1px solid",
-                    borderColor: multiplier === m ? "#f97316" : "#2a2a3a",
-                    background: multiplier === m ? "rgba(249,115,22,0.15)" : "transparent",
-                    color: multiplier === m ? "#f97316" : "#666",
-                    cursor: "pointer", fontSize: "13px", fontWeight: "600"
-                  }}
-                >
-                  {m}x
-                </button>
-              ))}
+                  onClick={() => applyUnitCount(unitCount - 1)}
+                  disabled={unitCount <= 1}
+                  style={{ width: "40px", height: "40px", borderRadius: "12px", border: "1px solid #2a2a3a", background: "#0a0a0f", color: unitCount <= 1 ? "#333" : "#fff", fontSize: "20px", cursor: unitCount <= 1 ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+                >−</button>
+                <span style={{ color: "#f97316", fontSize: "24px", fontWeight: "800", minWidth: "80px", textAlign: "center" }}>
+                  {unitCount} <span style={{ fontSize: "14px", color: "#888", fontWeight: "500" }}>{result.unit_name || "份"}</span>
+                </span>
+                <button
+                  onClick={() => applyUnitCount(unitCount + 1)}
+                  style={{ width: "40px", height: "40px", borderRadius: "12px", border: "1px solid #2a2a3a", background: "#0a0a0f", color: "#fff", fontSize: "20px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+                >+</button>
+              </div>
+              <div style={{ color: "#666", fontSize: "12px", marginBottom: "8px" }}>每{result.unit_name || "份"}大小</div>
+              <div style={{ display: "flex", gap: "8px" }}>
+                {[{ v: 0.8, label: "偏小" }, { v: 1, label: "正常" }, { v: 1.2, label: "偏大" }].map(s => (
+                  <button
+                    key={s.v}
+                    onClick={() => applySizeFactor(s.v)}
+                    style={{
+                      flex: 1, padding: "8px 0", borderRadius: "10px", border: "1px solid",
+                      borderColor: sizeFactor === s.v ? "#f97316" : "#2a2a3a",
+                      background: sizeFactor === s.v ? "rgba(249,115,22,0.15)" : "transparent",
+                      color: sizeFactor === s.v ? "#f97316" : "#666",
+                      cursor: "pointer", fontSize: "13px", fontWeight: "600"
+                    }}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
+          ) : (
+            <div style={{ background: "#16161f", borderRadius: "16px", padding: "14px 16px", border: "1px solid #2a2a3a", marginBottom: "14px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                <span style={{ color: "#888", fontSize: "13px" }}>份量调整（AI 估算：{result.portion}）</span>
+                <span style={{ color: "#f97316", fontSize: "13px", fontWeight: "600" }}>{multiplier}x</span>
+              </div>
+              <div style={{ display: "flex", gap: "8px" }}>
+                {[0.5, 0.75, 1, 1.5, 2].map(m => (
+                  <button
+                    key={m}
+                    onClick={() => applyMultiplier(m)}
+                    style={{
+                      flex: 1, padding: "8px 0", borderRadius: "10px", border: "1px solid",
+                      borderColor: multiplier === m ? "#f97316" : "#2a2a3a",
+                      background: multiplier === m ? "rgba(249,115,22,0.15)" : "transparent",
+                      color: multiplier === m ? "#f97316" : "#666",
+                      cursor: "pointer", fontSize: "13px", fontWeight: "600"
+                    }}
+                  >
+                    {m}x
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Editable result card */}
           <div style={{ background: "#16161f", borderRadius: "20px", padding: "24px", border: "1px solid #2a2a3a", marginBottom: "14px" }}>
