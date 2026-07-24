@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -39,6 +39,10 @@ function getLastNDays(n) {
 function formatDate(str) {
   const d = new Date(str + "T00:00:00");
   return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+// Trims a count like 2.0 -> "2" or 1.5 -> "1.5" for clean display in saved portion text.
+function formatCount(n) {
+  return (Math.round(n * 100) / 100).toString();
 }
 
 // ─── Learned unit weights (per-user portion memory) ───────────────────────────
@@ -84,45 +88,67 @@ function buildLearnedHint(learned) {
   return `\n\n用户历史份量修正参考（如果识别到同名或相似食物，请优先参考这些真实份量数据）：\n${lines.join("\n")}`;
 }
 
-// Safety net: if the AI doesn't return usable unit_count/unit_name (missing,
-// zero, or non-numeric), pull a leading number + counting word straight out
-// of its own portion text (e.g. "3块" → count 3, unit "块"). Falls back to a
-// single generic "份" so every food always gets an editable count.
-function parsePortionFallback(portion) {
-  if (portion) {
-    const m = String(portion).match(/^(\d+(?:\.\d+)?)\s*([\u4e00-\u9fa5]{1,2})/);
-    if (m) {
-      const count = parseFloat(m[1]);
-      if (count > 0) return { count, unitName: m[2] };
-    }
-  }
-  return { count: 1, unitName: "份" };
+// Safety net: if a component is missing usable unit_count/unit_name (missing,
+// zero, or non-numeric), fall back to a generic single "份" so every
+// component always has an editable, sane count.
+function normalizeComponent(c, idx) {
+  const unit_count = (typeof c.unit_count === "number" && c.unit_count > 0) ? c.unit_count
+    : (!isNaN(parseFloat(c.unit_count)) && parseFloat(c.unit_count) > 0) ? parseFloat(c.unit_count) : 1;
+  const unit_name = (c.unit_name && String(c.unit_name).trim()) ? c.unit_name : "份";
+  const calories = Number(c.calories) || 0;
+  const protein = Number(c.protein) || 0;
+  const fat = Number(c.fat) || 0;
+  const carbs = Number(c.carbs) || 0;
+  return {
+    id: `c${idx}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    name: c.name || "食物",
+    unitName: unit_name,
+    unitCount: unit_count,
+    origUnitCount: unit_count,
+    // Per-unit anchor: original total ÷ original count. Stays fixed as the
+    // reference point — count corrections just multiply against it, so the
+    // user never has to think in grams.
+    perUnit: {
+      calories: calories / unit_count,
+      protein: protein / unit_count,
+      fat: fat / unit_count,
+      carbs: carbs / unit_count,
+    },
+  };
 }
-// Normalizes a raw AI result so it always has a usable unit_count/unit_name,
+// Normalizes a raw AI result so it always has a usable components array,
 // regardless of whether the model complied with the schema this turn.
-function normalizeResult(r) {
-  const fallback = parsePortionFallback(r.portion);
-  const unit_count = (typeof r.unit_count === "number" && r.unit_count > 0) ? r.unit_count : fallback.count;
-  const unit_name = (r.unit_name && String(r.unit_name).trim()) ? r.unit_name : fallback.unitName;
-  return { ...r, unit_count, unit_name };
+function normalizeResult(raw) {
+  const rawComponents = Array.isArray(raw.components) && raw.components.length > 0
+    ? raw.components
+    : [{ name: raw.name, unit_name: raw.unit_name, unit_count: raw.unit_count, calories: raw.calories, protein: raw.protein, fat: raw.fat, carbs: raw.carbs }];
+  return {
+    name: raw.name || "食物",
+    confidence: raw.confidence || "medium",
+    components: rawComponents.map(normalizeComponent),
+  };
 }
 
 // ─── Gemini API ───────────────────────────────────────────────────────────────
 async function analyzeFood(imageBase64, mimeType, apiKey, learnedUnits = {}) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-  const prompt = `Analyze this food image and respond ONLY with a JSON object (no markdown, no explanation):
+  const prompt = `Analyze this food image. Identify EACH distinct food/ingredient separately (e.g. a plate of toast + eggs + prosciutto is THREE components, not one). Respond ONLY with a JSON object (no markdown, no explanation):
 {
-  "name": "food name in Chinese",
-  "calories": number,
-  "protein": number,
-  "fat": number,
-  "carbs": number,
-  "portion": "estimated portion size, described in natural units where possible (e.g. '3块' not just weight)",
+  "name": "a short overall name for the whole meal in Chinese, e.g. '烤面包配鸡蛋火腿'",
   "confidence": "high/medium/low",
-  "unit_name": "the natural counting word for this food's portion, in Chinese — a piece/serving word like '块','个','只','片','碗','杯','份'. Always provide one, even for foods without discrete pieces (use '份' or '碗' for things like soup, rice, salad)",
-  "unit_count": "number of that unit you estimate are in the image (e.g. 3 for '3块', 1 for a single bowl of soup). Always a positive number, never null"
+  "components": [
+    {
+      "name": "this ingredient's name in Chinese, e.g. '面包'",
+      "unit_name": "the natural counting word for this ingredient, in Chinese — a piece/serving word like '片','个','只','块','碗','杯','份'. Always provide one, even for things without discrete pieces (use '份' or '碗')",
+      "unit_count": "number of that unit you estimate for this ingredient (e.g. 2 for '2片'). Always a positive number",
+      "calories": number,
+      "protein": number,
+      "fat": number,
+      "carbs": number
+    }
+  ]
 }
-All nutritional values should be in grams (protein/fat/carbs) or kcal (calories) for the TOTAL portion shown, not per unit.${buildLearnedHint(learnedUnits)}`;
+Each component's nutritional values are for its OWN total portion, in grams (protein/fat/carbs) or kcal (calories), not per unit. If the image genuinely shows only one homogeneous food, "components" should have exactly one entry.${buildLearnedHint(learnedUnits)}`;
 
   const res = await fetch(url, {
     method: "POST",
@@ -150,19 +176,23 @@ All nutritional values should be in grams (protein/fat/carbs) or kcal (calories)
 // and Gemini estimates nutrition the same way it would from a photo.
 async function analyzeFoodText(description, apiKey, learnedUnits = {}) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-  const prompt = `Based on this food description (which may include a name, amount, and preparation method), estimate its nutrition. Respond ONLY with a JSON object (no markdown, no explanation):
+  const prompt = `Based on this food description (which may mention multiple foods, amounts, and preparation methods), identify EACH distinct food/ingredient separately. Respond ONLY with a JSON object (no markdown, no explanation):
 {
-  "name": "food name in Chinese",
-  "calories": number,
-  "protein": number,
-  "fat": number,
-  "carbs": number,
-  "portion": "the amount as stated, or your best estimate if not given, described in natural units where possible (e.g. '3块' not just weight)",
+  "name": "a short overall name for the whole meal in Chinese",
   "confidence": "high/medium/low",
-  "unit_name": "the natural counting word for this food's portion, in Chinese — a piece/serving word like '块','个','只','片','碗','杯','份'. Always provide one, even for foods without discrete pieces (use '份' or '碗' for things like soup, rice, salad)",
-  "unit_count": "number of that unit implied or stated in the description (e.g. 3 for '3块', 1 for a single bowl). Always a positive number, never null"
+  "components": [
+    {
+      "name": "this ingredient's name in Chinese",
+      "unit_name": "the natural counting word for this ingredient, in Chinese — a piece/serving word like '片','个','只','块','碗','杯','份'. Always provide one, even for things without discrete pieces (use '份' or '碗')",
+      "unit_count": "number of that unit implied or stated (e.g. 2 for '2片'). Always a positive number",
+      "calories": number,
+      "protein": number,
+      "fat": number,
+      "carbs": number
+    }
+  ]
 }
-All nutritional values should be in grams (protein/fat/carbs) or kcal (calories) for the TOTAL amount described, not per unit.${buildLearnedHint(learnedUnits)}
+Each component's nutritional values are for its OWN total amount described, in grams (protein/fat/carbs) or kcal (calories), not per unit. If the description genuinely names only one food, "components" should have exactly one entry.${buildLearnedHint(learnedUnits)}
 Food description: "${description}"`;
 
   const res = await fetch(url, {
@@ -486,45 +516,13 @@ function ScanPage({ apiKey, onAdd }) {
   const [imgSrc, setImgSrc] = useState(null);
   const [mimeType, setMimeType] = useState("image/jpeg");
   const [base64, setBase64] = useState(null);
-  const [result, setResult] = useState(null);       // raw AI estimate (base portion, count = its own estimate)
-  const [unitCount, setUnitCount] = useState(1);      // user-corrected piece/serving count
-  const [sizeFactor, setSizeFactor] = useState(1);    // "each unit was smaller/bigger than assumed"
-  const [form, setForm] = useState(null);            // editable, user-facing values
-  const [textDesc, setTextDesc] = useState("");       // for word/text-based entry
+  const [mealName, setMealName] = useState("");       // overall dish/meal name (editable)
+  const [confidence, setConfidence] = useState("medium");
+  const [components, setComponents] = useState(null); // array of per-ingredient cards, or null before analysis
+  const [textDesc, setTextDesc] = useState("");        // for word/text-based entry
   const [error, setError] = useState("");
-  const fileRef = useRef();
-  // eslint-disable-next-line no-unused-vars
-  const cameraRef = useRef();
-  const videoRef = useRef();
-  const streamRef = useRef();
-  const [cameraActive, setCameraActive] = useState(false);
-
-  const stopCamera = useCallback(() => {
-    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
-    setCameraActive(false);
-  }, []);
-
-  async function startCamera() {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-      streamRef.current = stream;
-      if (videoRef.current) videoRef.current.srcObject = stream;
-      setCameraActive(true);
-    } catch {
-      setError("无法访问摄像头，请检查权限");
-    }
-  }
-
-  function capturePhoto() {
-    const video = videoRef.current;
-    const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-    canvas.getContext("2d").drawImage(video, 0, 0);
-    const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
-    const b64 = dataUrl.split(",")[1];
-    setImgSrc(dataUrl); setBase64(b64); setMimeType("image/jpeg");
-    stopCamera(); setPhase("preview");
-  }
+  const fileRef = useRef();       // gallery/upload picker
+  const cameraRef = useRef();     // native camera picker (capture attribute)
 
   function handleFileChange(e) {
     const file = e.target.files[0];
@@ -538,102 +536,24 @@ function ScanPage({ apiKey, onAdd }) {
       setPhase("preview");
     };
     reader.readAsDataURL(file);
+    e.target.value = ""; // allow re-selecting the same file next time
+  }
+
+  function applyResult(r) {
+    setMealName(r.name);
+    setConfidence(r.confidence);
+    setComponents(r.components);
   }
 
   async function analyze() {
     setPhase("analyzing"); setError("");
     try {
       const raw = await analyzeFood(base64, mimeType, apiKey, loadLearnedUnits());
-      const r = normalizeResult(raw);
-      setResult(r);
-      setForm({ ...r });
-      setUnitCount(r.unit_count);
-      setSizeFactor(1);
+      applyResult(normalizeResult(raw));
       setPhase("result");
     } catch (e) {
       setError("识别失败：" + e.message); setPhase("preview");
     }
-  }
-
-  // Per-unit nutrition, derived from the AI's original total ÷ its original
-  // estimated count. This stays fixed as the anchor; count/size corrections
-  // just multiply against it, so the user never has to think in grams.
-  function getPerUnit() {
-    const baseCount = (result.unit_count && result.unit_count > 0) ? result.unit_count : 1;
-    return {
-      calories: result.calories / baseCount,
-      protein: result.protein / baseCount,
-      fat: result.fat / baseCount,
-      carbs: result.carbs / baseCount,
-    };
-  }
-
-  // Called when the user corrects "how many pieces" (descriptive, not gram-based).
-  function applyUnitCount(n) {
-    if (!result) return;
-    const count = Math.max(1, n);
-    setUnitCount(count);
-    const perUnit = getPerUnit();
-    setForm(f => ({
-      ...f,
-      calories: Math.round(perUnit.calories * count * sizeFactor),
-      protein: Math.round(perUnit.protein * count * sizeFactor * 10) / 10,
-      fat: Math.round(perUnit.fat * count * sizeFactor * 10) / 10,
-      carbs: Math.round(perUnit.carbs * count * sizeFactor * 10) / 10,
-      portion: `${count}${result.unit_name || "份"}`,
-    }));
-  }
-
-  // Called when the user says each piece looked smaller/about right/bigger
-  // than the AI assumed — a second, independent axis from count.
-  function applySizeFactor(sf) {
-    if (!result) return;
-    setSizeFactor(sf);
-    const perUnit = getPerUnit();
-    setForm(f => ({
-      ...f,
-      calories: Math.round(perUnit.calories * unitCount * sf),
-      protein: Math.round(perUnit.protein * unitCount * sf * 10) / 10,
-      fat: Math.round(perUnit.fat * unitCount * sf * 10) / 10,
-      carbs: Math.round(perUnit.carbs * unitCount * sf * 10) / 10,
-    }));
-  }
-
-  function updateField(key, value) {
-    setForm(f => ({ ...f, [key]: value }));
-  }
-
-  function confirmAdd() {
-    const entry = {
-      ...form,
-      calories: Math.round(Number(form.calories) || 0),
-      protein: Number(form.protein) || 0,
-      fat: Number(form.fat) || 0,
-      carbs: Number(form.carbs) || 0,
-      time: new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }),
-      id: Date.now()
-    };
-    onAdd(entry);
-
-    // If the user corrected the piece count or size, remember the resulting
-    // per-unit nutrition so future estimates for this food start from the
-    // user's real portions instead of guessing again.
-    if (result && (unitCount !== result.unit_count || sizeFactor !== 1)) {
-      const perUnit = {
-        calories: (entry.calories / unitCount),
-        protein: (entry.protein / unitCount),
-        fat: (entry.fat / unitCount),
-        carbs: (entry.carbs / unitCount),
-      };
-      recordUnitCorrection(form.name, result.unit_name || "份", perUnit);
-    }
-
-    reset();
-  }
-
-  function reset() {
-    setPhase("select"); setImgSrc(null); setBase64(null); setResult(null); setForm(null);
-    setUnitCount(1); setSizeFactor(1); setError(""); setTextDesc(""); stopCamera();
   }
 
   async function analyzeText() {
@@ -641,11 +561,7 @@ function ScanPage({ apiKey, onAdd }) {
     setPhase("analyzing"); setError("");
     try {
       const raw = await analyzeFoodText(textDesc.trim(), apiKey, loadLearnedUnits());
-      const r = normalizeResult(raw);
-      setResult(r);
-      setForm({ ...r });
-      setUnitCount(r.unit_count);
-      setSizeFactor(1);
+      applyResult(normalizeResult(raw));
       setImgSrc(null);
       setPhase("result");
     } catch (e) {
@@ -653,7 +569,102 @@ function ScanPage({ apiKey, onAdd }) {
     }
   }
 
-  useEffect(() => () => stopCamera(), [stopCamera]);
+  // Called when the user corrects "how many pieces/servings" for one ingredient
+  // (descriptive, not gram-based). Only that component's totals move — the
+  // rest of the meal, and the overall total below, stay independent.
+  function updateComponentCount(id, n) {
+    const count = Math.max(0, n);
+    setComponents(cs => cs.map(c => c.id === id ? { ...c, unitCount: count } : c));
+  }
+
+  function updateComponentName(id, name) {
+    setComponents(cs => cs.map(c => c.id === id ? { ...c, name } : c));
+  }
+
+  function updateComponentUnitName(id, unitName) {
+    setComponents(cs => cs.map(c => c.id === id ? { ...c, unitName } : c));
+  }
+
+  // Direct calorie override for one ingredient (e.g. the AI's per-piece
+  // estimate itself looked wrong). Re-anchors that component's per-unit value
+  // so future count changes scale from the corrected number, not the old one.
+  function updateComponentCalories(id, calories) {
+    setComponents(cs => cs.map(c => {
+      if (c.id !== id) return c;
+      const count = c.unitCount || 1;
+      return { ...c, perUnit: { ...c.perUnit, calories: Math.max(0, calories) / count } };
+    }));
+  }
+
+  function removeComponent(id) {
+    setComponents(cs => cs.filter(c => c.id !== id));
+  }
+
+  function addComponent() {
+    setComponents(cs => [
+      ...cs,
+      {
+        id: `manual_${Date.now()}`,
+        name: "新食材",
+        unitName: "份",
+        unitCount: 1,
+        origUnitCount: 1,
+        perUnit: { calories: 0, protein: 0, fat: 0, carbs: 0 },
+      },
+    ]);
+  }
+
+  // Live totals: the "conclusion" derived from every component's current
+  // count, always kept in sync — never edited directly.
+  function getTotals() {
+    return (components || []).reduce((t, c) => ({
+      calories: t.calories + c.perUnit.calories * c.unitCount,
+      protein: t.protein + c.perUnit.protein * c.unitCount,
+      fat: t.fat + c.perUnit.fat * c.unitCount,
+      carbs: t.carbs + c.perUnit.carbs * c.unitCount,
+    }), { calories: 0, protein: 0, fat: 0, carbs: 0 });
+  }
+
+  function confirmAdd() {
+    const totals = getTotals();
+    const entry = {
+      name: mealName || "食物",
+      calories: Math.round(totals.calories),
+      protein: Math.round(totals.protein * 10) / 10,
+      fat: Math.round(totals.fat * 10) / 10,
+      carbs: Math.round(totals.carbs * 10) / 10,
+      portion: components.map(c => `${c.name}${formatCount(c.unitCount)}${c.unitName}`).join("、"),
+      components: components.map(c => ({
+        name: c.name, unitName: c.unitName, unitCount: c.unitCount,
+        calories: Math.round(c.perUnit.calories * c.unitCount),
+        protein: Math.round(c.perUnit.protein * c.unitCount * 10) / 10,
+        fat: Math.round(c.perUnit.fat * c.unitCount * 10) / 10,
+        carbs: Math.round(c.perUnit.carbs * c.unitCount * 10) / 10,
+      })),
+      time: new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }),
+      id: Date.now()
+    };
+    onAdd(entry);
+
+    // For any ingredient whose count the user corrected, remember its
+    // resulting per-unit nutrition so future estimates for that food start
+    // from the user's real portions instead of guessing again.
+    components.forEach(c => {
+      if (c.origUnitCount !== undefined && c.unitCount !== c.origUnitCount) {
+        recordUnitCorrection(c.name, c.unitName, c.perUnit);
+      }
+    });
+
+    reset();
+  }
+
+  function reset() {
+    setPhase("select"); setImgSrc(null); setBase64(null);
+    setMealName(""); setConfidence("medium"); setComponents(null);
+    setError(""); setTextDesc("");
+  }
+
+  const totals = components ? getTotals() : null;
 
   return (
     <div style={{ padding: "24px 20px 100px", maxWidth: "430px", margin: "0 auto" }}>
@@ -661,31 +672,24 @@ function ScanPage({ apiKey, onAdd }) {
 
       {phase === "select" && (
         <>
-          {/* Camera */}
-          {cameraActive ? (
-            <div style={{ borderRadius: "20px", overflow: "hidden", marginBottom: "16px", position: "relative" }}>
-              <video ref={videoRef} autoPlay playsInline style={{ width: "100%", display: "block", borderRadius: "20px" }} />
-              <div style={{ position: "absolute", bottom: "16px", left: 0, right: 0, display: "flex", justifyContent: "center", gap: "16px" }}>
-                <button onClick={stopCamera} style={{ background: "rgba(0,0,0,0.6)", border: "1px solid rgba(255,255,255,0.2)", borderRadius: "50px", padding: "10px 20px", color: "#fff", cursor: "pointer", fontSize: "14px" }}>取消</button>
-                <button onClick={capturePhoto} style={{ background: "#fff", border: "4px solid rgba(255,255,255,0.5)", borderRadius: "50%", width: "64px", height: "64px", cursor: "pointer" }} />
-              </div>
-            </div>
-          ) : (
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "20px" }}>
-              <button onClick={startCamera} style={{ background: "linear-gradient(135deg, #f97316, #ef4444)", border: "none", borderRadius: "20px", padding: "28px 16px", color: "#fff", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
-                <IconCamera /><span style={{ fontSize: "15px", fontWeight: "600" }}>拍照</span>
-              </button>
-              <button onClick={() => fileRef.current.click()} style={{ background: "#16161f", border: "1px solid #2a2a3a", borderRadius: "20px", padding: "28px 16px", color: "#fff", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
-                <IconUpload /><span style={{ fontSize: "15px", fontWeight: "600" }}>上传图片</span>
-              </button>
-              <input ref={fileRef} type="file" accept="image/*" onChange={handleFileChange} style={{ display: "none" }} />
-            </div>
-          )}
-          {!cameraActive && (
-            <button onClick={() => setPhase("textInput")} style={{ width: "100%", background: "#16161f", border: "1px solid #2a2a3a", borderRadius: "16px", padding: "14px", color: "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", fontSize: "14px", fontWeight: "600", marginBottom: "20px" }}>
-              <IconEdit /> 文字输入食物
+          {/* Camera / Upload */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "20px" }}>
+            <button onClick={() => cameraRef.current.click()} style={{ background: "linear-gradient(135deg, #f97316, #ef4444)", border: "none", borderRadius: "20px", padding: "28px 16px", color: "#fff", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
+              <IconCamera /><span style={{ fontSize: "15px", fontWeight: "600" }}>拍照</span>
             </button>
-          )}
+            <button onClick={() => fileRef.current.click()} style={{ background: "#16161f", border: "1px solid #2a2a3a", borderRadius: "20px", padding: "28px 16px", color: "#fff", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
+              <IconUpload /><span style={{ fontSize: "15px", fontWeight: "600" }}>上传图片</span>
+            </button>
+            {/* capture="environment" opens the phone's native camera app directly —
+                far more reliable than getUserMedia, which needs the browser/webview
+                to grant live camera access inside this sandboxed iframe and often
+                silently fails to do so on mobile even when it works fine on desktop. */}
+            <input ref={cameraRef} type="file" accept="image/*" capture="environment" onChange={handleFileChange} style={{ display: "none" }} />
+            <input ref={fileRef} type="file" accept="image/*" onChange={handleFileChange} style={{ display: "none" }} />
+          </div>
+          <button onClick={() => setPhase("textInput")} style={{ width: "100%", background: "#16161f", border: "1px solid #2a2a3a", borderRadius: "16px", padding: "14px", color: "#fff", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", fontSize: "14px", fontWeight: "600", marginBottom: "20px" }}>
+            <IconEdit /> 文字输入食物
+          </button>
           {error && <p style={{ color: "#ef4444", fontSize: "14px", textAlign: "center" }}>{error}</p>}
           <div style={{ background: "#16161f", borderRadius: "16px", padding: "16px", border: "1px solid #2a2a3a" }}>
             <p style={{ color: "#666", fontSize: "13px", lineHeight: "1.6", margin: 0 }}>💡 小贴士：拍摄时让食物居中，光线充足，识别效果更佳；也可以直接用文字描述食物和份量</p>
@@ -732,7 +736,7 @@ function ScanPage({ apiKey, onAdd }) {
         </div>
       )}
 
-      {phase === "result" && result && form && (
+      {phase === "result" && components && (
         <div>
           {imgSrc ? (
             <img src={imgSrc} alt="food" style={{ width: "100%", borderRadius: "20px", marginBottom: "16px", maxHeight: "240px", objectFit: "cover" }} />
@@ -740,70 +744,16 @@ function ScanPage({ apiKey, onAdd }) {
             <div style={{ width: "100%", height: "100px", borderRadius: "20px", marginBottom: "16px", background: "#16161f", border: "1px solid #2a2a3a", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "36px" }}>✏️</div>
           )}
 
-          {/* Portion adjustment: always descriptive — count + size, never grams */}
-          <div style={{ background: "#16161f", borderRadius: "16px", padding: "14px 16px", border: "1px solid #2a2a3a", marginBottom: "14px" }}>
-            <div style={{ color: "#888", fontSize: "13px", marginBottom: "10px" }}>
-              AI 识别份量：{result.unit_count} {result.unit_name} · 数量不对可直接改
-            </div>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "14px", marginBottom: "14px" }}>
-              <button
-                onClick={() => applyUnitCount(unitCount - 1)}
-                disabled={unitCount <= 1}
-                style={{ width: "40px", height: "40px", borderRadius: "12px", border: "1px solid #2a2a3a", background: "#0a0a0f", color: unitCount <= 1 ? "#333" : "#fff", fontSize: "20px", cursor: unitCount <= 1 ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}
-              >−</button>
-              <div style={{ display: "flex", alignItems: "baseline", gap: "6px" }}>
-                <input
-                  type="number"
-                  value={unitCount}
-                  onChange={e => applyUnitCount(Number(e.target.value) || 1)}
-                  style={{ width: "56px", background: "transparent", border: "none", borderBottom: "1px solid #2a2a3a", color: "#f97316", fontSize: "24px", fontWeight: "800", textAlign: "center", outline: "none" }}
-                />
-                <input
-                  value={result.unit_name}
-                  onChange={e => setResult(r => ({ ...r, unit_name: e.target.value }))}
-                  style={{ width: "44px", background: "transparent", border: "none", borderBottom: "1px solid #2a2a3a", color: "#888", fontSize: "14px", fontWeight: "500", outline: "none" }}
-                />
-              </div>
-              <button
-                onClick={() => applyUnitCount(unitCount + 1)}
-                style={{ width: "40px", height: "40px", borderRadius: "12px", border: "1px solid #2a2a3a", background: "#0a0a0f", color: "#fff", fontSize: "20px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}
-              >+</button>
-            </div>
-            <div style={{ color: "#666", fontSize: "12px", marginBottom: "8px" }}>每{result.unit_name}大小</div>
-            <div style={{ display: "flex", gap: "8px" }}>
-              {[{ v: 0.8, label: "偏小" }, { v: 1, label: "正常" }, { v: 1.2, label: "偏大" }].map(s => (
-                <button
-                  key={s.v}
-                  onClick={() => applySizeFactor(s.v)}
-                  style={{
-                    flex: 1, padding: "8px 0", borderRadius: "10px", border: "1px solid",
-                    borderColor: sizeFactor === s.v ? "#f97316" : "#2a2a3a",
-                    background: sizeFactor === s.v ? "rgba(249,115,22,0.15)" : "transparent",
-                    color: sizeFactor === s.v ? "#f97316" : "#666",
-                    cursor: "pointer", fontSize: "13px", fontWeight: "600"
-                  }}
-                >
-                  {s.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Editable result card */}
+          {/* Total summary — the "conclusion", always derived from the components below */}
           <div style={{ background: "#16161f", borderRadius: "20px", padding: "24px", border: "1px solid #2a2a3a", marginBottom: "14px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "12px", marginBottom: "20px" }}>
               <input
-                value={form.name}
-                onChange={e => updateField("name", e.target.value)}
+                value={mealName}
+                onChange={e => setMealName(e.target.value)}
                 style={{ flex: 1, background: "transparent", border: "none", borderBottom: "1px solid #2a2a3a", color: "#fff", fontSize: "20px", fontWeight: "700", padding: "4px 0", outline: "none" }}
               />
               <div style={{ textAlign: "right", flexShrink: 0 }}>
-                <input
-                  type="number"
-                  value={form.calories}
-                  onChange={e => updateField("calories", e.target.value)}
-                  style={{ width: "90px", background: "transparent", border: "none", borderBottom: "1px solid #2a2a3a", color: "#f97316", fontSize: "26px", fontWeight: "800", textAlign: "right", outline: "none" }}
-                />
+                <div style={{ color: "#f97316", fontSize: "26px", fontWeight: "800" }}>{Math.round(totals.calories)}</div>
                 <div style={{ color: "#666", fontSize: "12px" }}>kcal</div>
               </div>
             </div>
@@ -814,22 +764,62 @@ function ScanPage({ apiKey, onAdd }) {
                 { key: "carbs", label: "碳水", color: "#a78bfa" },
               ].map(m => (
                 <div key={m.key} style={{ background: "#0a0a0f", borderRadius: "12px", padding: "10px", textAlign: "center" }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "2px" }}>
-                    <input
-                      type="number"
-                      value={form[m.key]}
-                      onChange={e => updateField(m.key, e.target.value)}
-                      style={{ width: "48px", background: "transparent", border: "none", color: m.color, fontSize: "16px", fontWeight: "700", textAlign: "right", outline: "none" }}
-                    />
-                    <span style={{ color: m.color, fontSize: "12px" }}>g</span>
-                  </div>
+                  <div style={{ color: m.color, fontSize: "16px", fontWeight: "700" }}>{totals[m.key].toFixed(1)}<span style={{ fontSize: "12px" }}>g</span></div>
                   <div style={{ color: "#555", fontSize: "11px", marginTop: "3px" }}>{m.label}</div>
                 </div>
               ))}
             </div>
             <div style={{ marginTop: "14px", textAlign: "right" }}>
-              <span style={{ color: "#444", fontSize: "12px" }}>置信度：{result.confidence === "high" ? "高 ✓" : result.confidence === "medium" ? "中等" : "较低"} · 可直接点击数值修改</span>
+              <span style={{ color: "#444", fontSize: "12px" }}>置信度：{confidence === "high" ? "高 ✓" : confidence === "medium" ? "中等" : "较低"} · 由下方食材自动汇总</span>
             </div>
+          </div>
+
+          {/* Per-ingredient breakdown — descriptive portion, never grams */}
+          <div style={{ background: "#16161f", borderRadius: "20px", border: "1px solid #2a2a3a", marginBottom: "14px", overflow: "hidden" }}>
+            {components.map((c, i) => (
+              <div key={c.id} style={{ padding: "16px 18px", borderBottom: i < components.length - 1 ? "1px solid #2a2a3a" : "none" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <input
+                      value={c.name}
+                      onChange={e => updateComponentName(c.id, e.target.value)}
+                      style={{ width: "100%", background: "transparent", border: "none", color: "#fff", fontSize: "15px", fontWeight: "600", padding: "2px 0", outline: "none", marginBottom: "4px" }}
+                    />
+                    <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
+                      <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: "#f97316", display: "inline-block", flexShrink: 0 }} />
+                      <input
+                        type="number"
+                        value={Math.round(c.perUnit.calories * c.unitCount)}
+                        onChange={e => updateComponentCalories(c.id, Number(e.target.value) || 0)}
+                        style={{ width: "52px", background: "transparent", border: "none", color: "#ccc", fontSize: "13px", padding: 0, outline: "none" }}
+                      />
+                      <span style={{ color: "#666", fontSize: "13px" }}>cal</span>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", flexShrink: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "3px", border: "1px solid #f97316", borderRadius: "10px", padding: "6px 10px" }}>
+                      <input
+                        type="number"
+                        value={c.unitCount}
+                        onChange={e => updateComponentCount(c.id, Number(e.target.value))}
+                        style={{ width: "34px", background: "transparent", border: "none", color: "#f97316", fontSize: "14px", fontWeight: "700", textAlign: "right", outline: "none" }}
+                      />
+                      <input
+                        value={c.unitName}
+                        onChange={e => updateComponentUnitName(c.id, e.target.value)}
+                        style={{ width: "30px", background: "transparent", border: "none", color: "#f97316", fontSize: "13px", outline: "none" }}
+                      />
+                    </div>
+                    <button onClick={() => removeComponent(c.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#444", padding: "2px" }}>
+                      <IconTrash />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+            <button onClick={addComponent} style={{ width: "100%", background: "none", border: "none", borderTop: components.length > 0 ? "1px solid #2a2a3a" : "none", padding: "14px", color: "#f97316", cursor: "pointer", fontSize: "14px", fontWeight: "600" }}>
+              + 添加食材
+            </button>
           </div>
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
