@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -127,6 +127,32 @@ function normalizeResult(raw) {
     confidence: raw.confidence || "medium",
     components: rawComponents.map(normalizeComponent),
   };
+}
+
+// Rebuilds editable component objects from a previously saved entry, for the
+// "repeat entry" flow. Produces the exact same shape normalizeComponent does,
+// so the existing count stepper / calorie edit / scale-all controls all work
+// on it identically to a fresh AI result — no separate UI path needed.
+function componentsFromSavedEntry(entry) {
+  const source = Array.isArray(entry.components) && entry.components.length > 0
+    ? entry.components
+    : [{ name: entry.name, unitName: "份", unitCount: 1, calories: entry.calories, protein: entry.protein, fat: entry.fat, carbs: entry.carbs }];
+  return source.map((c, idx) => {
+    const unitCount = (typeof c.unitCount === "number" && c.unitCount > 0) ? c.unitCount : 1;
+    return {
+      id: `rep${idx}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      name: c.name || "食物",
+      unitName: c.unitName || "份",
+      unitCount,
+      origUnitCount: unitCount,
+      perUnit: {
+        calories: (Number(c.calories) || 0) / unitCount,
+        protein: (Number(c.protein) || 0) / unitCount,
+        fat: (Number(c.fat) || 0) / unitCount,
+        carbs: (Number(c.carbs) || 0) / unitCount,
+      },
+    };
+  });
 }
 
 // ─── Gemini API ───────────────────────────────────────────────────────────────
@@ -275,6 +301,12 @@ const IconEdit = () => (
     <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
   </svg>
 );
+const IconRepeat = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="18" height="18">
+    <polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>
+    <polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+  </svg>
+);
 
 // ─── API Key Setup Screen ─────────────────────────────────────────────────────
 function ApiKeySetup({ onSave }) {
@@ -392,7 +424,7 @@ function SettingsPage({ targets, onSave, onBack }) {
 }
 
 // ─── Home Page ────────────────────────────────────────────────────────────────
-function HomePage({ data, targets, onNavigate, onOpenSettings }) {
+function HomePage({ data, targets, onNavigate, onOpenSettings, onRepeat }) {
   const today = todayStr();
   const todayEntries = data[today] || [];
   const totalCal = todayEntries.reduce((s, e) => s + e.calories, 0);
@@ -493,7 +525,12 @@ function HomePage({ data, targets, onNavigate, onOpenSettings }) {
                   <div style={{ color: "#e5e5e5", fontSize: "14px", fontWeight: "500" }}>{e.name}</div>
                   <div style={{ color: "#555", fontSize: "12px" }}>{e.time} · {e.portion}</div>
                 </div>
-                <div style={{ color: "#f97316", fontSize: "15px", fontWeight: "600" }}>{e.calories} kcal</div>
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <button onClick={() => onRepeat(e)} title="再次记录这道菜" style={{ background: "none", border: "none", cursor: "pointer", color: "#f97316", padding: "2px" }}>
+                    <IconRepeat />
+                  </button>
+                  <div style={{ color: "#f97316", fontSize: "15px", fontWeight: "600" }}>{e.calories} kcal</div>
+                </div>
               </div>
             ))}
           </div>
@@ -511,7 +548,7 @@ function HomePage({ data, targets, onNavigate, onOpenSettings }) {
 }
 
 // ─── Scan Page ────────────────────────────────────────────────────────────────
-function ScanPage({ apiKey, onAdd }) {
+function ScanPage({ apiKey, onAdd, seedEntry, onSeedConsumed }) {
   const [phase, setPhase] = useState("select"); // select | preview | textInput | analyzing | result
   const [imgSrc, setImgSrc] = useState(null);
   const [mimeType, setMimeType] = useState("image/jpeg");
@@ -523,6 +560,21 @@ function ScanPage({ apiKey, onAdd }) {
   const [error, setError] = useState("");
   const fileRef = useRef();       // gallery/upload picker
   const cameraRef = useRef();     // native camera picker (capture attribute)
+
+  // "Repeat entry" flow: when opened with a previously saved entry (from
+  // Records or Home's recent list), skip photo/AI entirely and drop straight
+  // into the editable result screen, pre-filled with that dish's data. No
+  // network call — reuses the numbers already saved, so it's instant.
+  useEffect(() => {
+    if (!seedEntry) return;
+    setMealName(seedEntry.name || "食物");
+    setConfidence("high");
+    setComponents(componentsFromSavedEntry(seedEntry));
+    setImgSrc(null);
+    setPhase("result");
+    onSeedConsumed && onSeedConsumed();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seedEntry]);
 
   function handleFileChange(e) {
     const file = e.target.files[0];
@@ -596,6 +648,14 @@ function ScanPage({ apiKey, onAdd }) {
     }));
   }
 
+  // Quick portion-scale control — mainly for repeat-entry ("I went back for
+  // a second serving, but only about half as much this time"), though it
+  // works on any result. Scales every component from its original baseline
+  // count, so it's one tap instead of adjusting each ingredient's stepper.
+  function scaleAllComponents(factor) {
+    setComponents(cs => cs.map(c => ({ ...c, unitCount: Math.max(0, Math.round(c.origUnitCount * factor * 100) / 100) })));
+  }
+
   function removeComponent(id) {
     setComponents(cs => cs.filter(c => c.id !== id));
   }
@@ -662,6 +722,7 @@ function ScanPage({ apiKey, onAdd }) {
     setPhase("select"); setImgSrc(null); setBase64(null);
     setMealName(""); setConfidence("medium"); setComponents(null);
     setError(""); setTextDesc("");
+    onSeedConsumed && onSeedConsumed();
   }
 
   const totals = components ? getTotals() : null;
@@ -774,6 +835,16 @@ function ScanPage({ apiKey, onAdd }) {
             </div>
           </div>
 
+          {/* Quick portion scale — multiplies every ingredient's count from its
+              original baseline, e.g. for a smaller/bigger second serving */}
+          <div style={{ display: "flex", gap: "8px", marginBottom: "14px" }}>
+            {[{ f: 0.5, l: "0.5×" }, { f: 1, l: "1×" }, { f: 1.5, l: "1.5×" }, { f: 2, l: "2×" }].map(s => (
+              <button key={s.l} onClick={() => scaleAllComponents(s.f)} style={{ flex: 1, background: "#16161f", border: "1px solid #2a2a3a", borderRadius: "12px", padding: "10px", color: "#888", cursor: "pointer", fontSize: "13px", fontWeight: "600" }}>
+                {s.l}
+              </button>
+            ))}
+          </div>
+
           {/* Per-ingredient breakdown — descriptive portion, never grams */}
           <div style={{ background: "#16161f", borderRadius: "20px", border: "1px solid #2a2a3a", marginBottom: "14px", overflow: "hidden" }}>
             {components.map((c, i) => (
@@ -833,7 +904,7 @@ function ScanPage({ apiKey, onAdd }) {
 }
 
 // ─── Records Page ─────────────────────────────────────────────────────────────
-function RecordsPage({ data, onDelete }) {
+function RecordsPage({ data, onDelete, onRepeat }) {
   const today = todayStr();
   const entries = data[today] || [];
   const total = entries.reduce((s, e) => s + e.calories, 0);
@@ -861,6 +932,9 @@ function RecordsPage({ data, onDelete }) {
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
                 <span style={{ color: "#f97316", fontSize: "16px", fontWeight: "700" }}>{e.calories}</span>
+                <button onClick={() => onRepeat(e)} title="再次记录这道菜" style={{ background: "none", border: "none", cursor: "pointer", color: "#f97316", padding: "4px" }}>
+                  <IconRepeat />
+                </button>
                 <button onClick={() => onDelete(today, e.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#444", padding: "4px" }}>
                   <IconTrash />
                 </button>
@@ -949,6 +1023,15 @@ export default function App() {
   const [page, setPage] = useState("home");
   const [data, setData] = useState(loadData);
   const [targets, setTargets] = useState(loadTargets);
+  const [repeatSeed, setRepeatSeed] = useState(null); // entry to pre-fill on the scan page, for "repeat entry"
+
+  // Jumps to the scan page pre-filled with a past entry's data, for quickly
+  // re-logging something eaten again (e.g. going back for seconds at a
+  // shared-dish meal) without re-photographing or re-estimating from scratch.
+  function repeatEntry(entry) {
+    setRepeatSeed(entry);
+    setPage("scan");
+  }
 
   function addEntry(entry) {
     const today = todayStr();
@@ -982,9 +1065,9 @@ export default function App() {
       <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
 
       {/* Page Content */}
-      {page === "home" && <HomePage data={data} targets={targets} onNavigate={setPage} onOpenSettings={() => setPage("settings")} />}
-      {page === "scan" && <ScanPage apiKey={apiKey} onAdd={addEntry} />}
-      {page === "records" && <RecordsPage data={data} onDelete={deleteEntry} />}
+      {page === "home" && <HomePage data={data} targets={targets} onNavigate={setPage} onOpenSettings={() => setPage("settings")} onRepeat={repeatEntry} />}
+      {page === "scan" && <ScanPage apiKey={apiKey} onAdd={addEntry} seedEntry={repeatSeed} onSeedConsumed={() => setRepeatSeed(null)} />}
+      {page === "records" && <RecordsPage data={data} onDelete={deleteEntry} onRepeat={repeatEntry} />}
       {page === "trends" && <TrendsPage data={data} targets={targets} />}
       {page === "settings" && <SettingsPage targets={targets} onSave={setTargets} onBack={() => setPage("home")} />}
 
